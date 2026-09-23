@@ -1,217 +1,245 @@
-"""Precedent retriever using SentenceTransformers + FAISS (CPU only).
-
-Dependency install command:
-	pip install sentence-transformers faiss-cpu numpy pickle
-"""
+"""Precedent retriever using OpenAI Embeddings + ChromaDB + Multi-Query + RRF."""
 
 from __future__ import annotations
 
-import pickle
+from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List
 
-import faiss
-import numpy as np
-from sentence_transformers import SentenceTransformer
-
-
-MODEL_NAME = "all-MiniLM-L6-v2"
-INDEX_FILENAME = "cases.index"
-METADATA_FILENAME = "cases.pkl"
-EMBEDDING_BATCH_SIZE = 128
-
+from langchain_chroma import Chroma
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.document_loaders import DirectoryLoader, TextLoader
+from pydantic import BaseModel
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CASES_DIR = PROJECT_ROOT / "data" / "cases"
-VECTOR_DB_DIR = PROJECT_ROOT / "vector_db"
-INDEX_PATH = VECTOR_DB_DIR / INDEX_FILENAME
-METADATA_PATH = VECTOR_DB_DIR / METADATA_FILENAME
+PERSIST_DIR = PROJECT_ROOT / "vector_db" / "chroma_cases"
+
+_db = None
 
 
-_model: Optional[SentenceTransformer] = None
-_index: Optional[faiss.Index] = None
-_cases: Optional[List[Dict[str, str]]] = None
+# ──────────────────────────────────────────────────────────────────
+# DATABASE SETUP
+# ──────────────────────────────────────────────────────────────────
+
+def _get_embedding_model() -> OpenAIEmbeddings:
+	return OpenAIEmbeddings(model="text-embedding-3-small")
 
 
-def _get_model() -> SentenceTransformer:
-	global _model
-	if _model is None:
-		print(f"[precedent_retriever] Loading embedding model: {MODEL_NAME} (CPU only)...")
-		_model = SentenceTransformer(MODEL_NAME, device="cpu")
-		print("[precedent_retriever] Model loaded.")
-	return _model
+def _get_db() -> Chroma:
+	"""Load or create the ChromaDB vector store for case precedents."""
+	global _db
+	if _db is not None:
+		return _db
 
+	persist_path = str(PERSIST_DIR)
+	embedding_model = _get_embedding_model()
 
-def _load_case_documents(cases_dir: Path = CASES_DIR) -> List[Dict[str, str]]:
-	if not cases_dir.exists():
-		raise FileNotFoundError(f"Cases directory not found: {cases_dir}")
-
-	files = sorted(cases_dir.glob("*.txt"))
-	if not files:
-		raise FileNotFoundError(f"No .txt case files found in: {cases_dir}")
-
-	print(f"[precedent_retriever] Found {len(files)} case files. Loading text...")
-	records: List[Dict[str, str]] = []
-	for idx, file_path in enumerate(files, start=1):
-		case_text = file_path.read_text(encoding="utf-8", errors="ignore").strip()
-		records.append(
-			{
-				"case_id": file_path.name,
-				"text": case_text,
-			}
+	# Check if the database already exists on disk
+	if PERSIST_DIR.exists():
+		print("[precedent_retriever] Loading existing ChromaDB from disk...")
+		_db = Chroma(
+			persist_directory=persist_path,
+			embedding_function=embedding_model,
+			collection_name="cases",
 		)
-		if idx % 500 == 0 or idx == len(files):
-			print(f"[precedent_retriever] Processed {idx}/{len(files)} case files...")
+		doc_count = _db._collection.count()
+		print(f"[precedent_retriever] Loaded {doc_count} chunks from ChromaDB.")
+		return _db
 
-	print("[precedent_retriever] Completed loading case documents.")
-	return records
+	# Build from scratch
+	print("[precedent_retriever] ChromaDB not found. Building from scratch...")
+	_db = _build_vector_store()
+	return _db
 
 
-def _embed_texts(texts: Sequence[str], batch_size: int = EMBEDDING_BATCH_SIZE) -> np.ndarray:
-	model = _get_model()
-	print(f"[precedent_retriever] Generating embeddings for {len(texts)} cases...")
-	embeddings = model.encode(
-		list(texts),
-		batch_size=batch_size,
-		show_progress_bar=True,
-		convert_to_numpy=True,
-		normalize_embeddings=True,
+def _build_vector_store() -> Chroma:
+	"""Load case .txt files, chunk them, embed, and store in ChromaDB."""
+	if not CASES_DIR.exists():
+		raise FileNotFoundError(f"Cases directory not found: {CASES_DIR}")
+
+	# Step 1: Load all .txt files
+	print(f"[precedent_retriever] Loading case files from {CASES_DIR}...")
+	loader = DirectoryLoader(
+		str(CASES_DIR),
+		glob="*.txt",
+		loader_cls=TextLoader,
+		loader_kwargs={"encoding": "utf-8", "autodetect_encoding": True},
+		show_progress=True,
 	)
-	embeddings = np.asarray(embeddings, dtype=np.float32)
-	print(f"[precedent_retriever] Embeddings generated with shape: {embeddings.shape}")
-	return embeddings
+	documents = loader.load()
+	print(f"[precedent_retriever] Loaded {len(documents)} case files.")
+
+	# Step 2: Chunk the documents
+	print("[precedent_retriever] Splitting documents into chunks...")
+	text_splitter = RecursiveCharacterTextSplitter(
+		chunk_size=800,
+		chunk_overlap=100,
+		separators=["\n\n", "\n", ". ", " ", ""],
+	)
+	chunks = text_splitter.split_documents(documents)
+	print(f"[precedent_retriever] Created {len(chunks)} chunks.")
+
+	# Step 3: Embed and store in ChromaDB
+	print("[precedent_retriever] Embedding chunks and storing in ChromaDB...")
+	print("[precedent_retriever] This will take ~15 minutes for 73K chunks. Be patient!")
+
+	embedding_model = _get_embedding_model()
+	db = Chroma.from_documents(
+		documents=chunks,
+		embedding=embedding_model,
+		persist_directory=str(PERSIST_DIR),
+		collection_name="cases",
+	)
+	print(f"[precedent_retriever] ✅ ChromaDB built with {db._collection.count()} chunks.")
+	return db
 
 
-def _build_faiss_index(embeddings: np.ndarray) -> faiss.Index:
-	if embeddings.ndim != 2:
-		raise ValueError("Embeddings must be a 2D array of shape (n_samples, embedding_dim)")
+# ──────────────────────────────────────────────────────────────────
+# INITIALIZATION
+# ──────────────────────────────────────────────────────────────────
 
-	embedding_dim = embeddings.shape[1]
-	print(f"[precedent_retriever] Building FAISS index (dim={embedding_dim})...")
-	index = faiss.IndexFlatIP(embedding_dim)
-	index.add(embeddings)
-	print(f"[precedent_retriever] FAISS index built with {index.ntotal} vectors.")
-	return index
-
-
-def build_and_save_precedent_index(
-	cases_dir: Path = CASES_DIR,
-	index_path: Path = INDEX_PATH,
-	metadata_path: Path = METADATA_PATH,
-) -> None:
-	print("[precedent_retriever] Starting precedent indexing pipeline...")
-	records = _load_case_documents(cases_dir)
-	texts = [record["text"] for record in records]
-	embeddings = _embed_texts(texts)
-	index = _build_faiss_index(embeddings)
-
-	index_path.parent.mkdir(parents=True, exist_ok=True)
-	print(f"[precedent_retriever] Saving FAISS index to: {index_path}")
-	faiss.write_index(index, str(index_path))
-
-	print(f"[precedent_retriever] Saving case metadata to: {metadata_path}")
-	with metadata_path.open("wb") as fp:
-		pickle.dump(records, fp)
-
-	print("[precedent_retriever] Precedent indexing pipeline completed successfully.")
-
-
-def _load_saved_index_and_metadata(
-	index_path: Path = INDEX_PATH,
-	metadata_path: Path = METADATA_PATH,
-) -> tuple[faiss.Index, List[Dict[str, str]]]:
-	if not index_path.exists() or not metadata_path.exists():
-		raise FileNotFoundError(
-			"Saved precedent index artifacts not found. "
-			"Run build_and_save_precedent_index() first."
-		)
-
-	print(f"[precedent_retriever] Loading FAISS index from: {index_path}")
-	index = faiss.read_index(str(index_path))
-
-	print(f"[precedent_retriever] Loading case metadata from: {metadata_path}")
-	with metadata_path.open("rb") as fp:
-		records = pickle.load(fp)
-
-	if len(records) != index.ntotal:
-		raise ValueError(f"Index/case count mismatch: index={index.ntotal}, cases={len(records)}")
-
-	return index, records
-
-
-def initialize_precedent_retriever(
-	cases_dir: Path = CASES_DIR,
-	index_path: Path = INDEX_PATH,
-	metadata_path: Path = METADATA_PATH,
-) -> Dict[str, object]:
-	global _index, _cases
-
-	created = False
-	if not index_path.exists() or not metadata_path.exists():
-		print("[precedent_retriever] Index artifacts missing. Rebuilding case embeddings...")
-		build_and_save_precedent_index(
-			cases_dir=cases_dir,
-			index_path=index_path,
-			metadata_path=metadata_path,
-		)
-		created = True
-
-	_index, _cases = _load_saved_index_and_metadata(index_path=index_path, metadata_path=metadata_path)
-
+def initialize_precedent_retriever() -> Dict[str, object]:
+	"""Initialize the precedent retriever. Builds the DB if it doesn't exist."""
+	db = _get_db()
+	chunk_count = db._collection.count()
+	created = not PERSIST_DIR.exists() or chunk_count == 0
 	return {
 		"created": created,
-		"case_count": len(_cases),
-		"index_path": str(index_path),
-		"metadata_path": str(metadata_path),
+		"case_count": chunk_count,
 	}
 
 
-def _ensure_loaded() -> tuple[faiss.Index, List[Dict[str, str]]]:
-	global _index, _cases
-	if _index is None or _cases is None:
-		_index, _cases = _load_saved_index_and_metadata()
-	return _index, _cases
+# ──────────────────────────────────────────────────────────────────
+# BASIC RETRIEVAL (MMR)
+# ──────────────────────────────────────────────────────────────────
 
-
-def retrieve_precedents(query: str, top_k: int = 3) -> List[Dict[str, object]]:
+def retrieve_precedents(query: str, top_k: int = 15) -> List[Dict[str, object]]:
+	"""Retrieve top-k precedent chunks using MMR for diversity."""
 	if not query or not query.strip():
 		raise ValueError("Query must be a non-empty string.")
-	if top_k <= 0:
-		raise ValueError("top_k must be greater than 0.")
 
-	index, records = _ensure_loaded()
-	model = _get_model()
+	db = _get_db()
 
-	print(f"[precedent_retriever] Retrieving top {top_k} precedents for query...")
-	query_embedding = model.encode(
-		[query.strip()],
-		convert_to_numpy=True,
-		normalize_embeddings=True,
+	print(f"[precedent_retriever] Retrieving top {top_k} precedents (MMR)...")
+	retriever = db.as_retriever(
+		search_type="mmr",
+		search_kwargs={"k": top_k, "fetch_k": top_k * 3, "lambda_mult": 0.5},
 	)
-	query_embedding = np.asarray(query_embedding, dtype=np.float32)
 
-	search_k = min(top_k, index.ntotal)
-	scores, indices = index.search(query_embedding, search_k)
+	docs = retriever.invoke(query)
 
-	results: List[Dict[str, object]] = []
-	for score, idx in zip(scores[0], indices[0]):
-		if idx < 0:
-			continue
+	results = []
+	for i, doc in enumerate(docs):
+		source = doc.metadata.get("source", "unknown")
+		case_id = Path(source).name if source != "unknown" else "unknown"
+		results.append({
+			"rank": i + 1,
+			"case_id": case_id,
+			"text": doc.page_content,
+			"text_preview": doc.page_content[:300],
+		})
 
-		record = records[idx]
-		full_text = (record.get("text", "") or "").strip()
-		results.append(
-			{
-				"case_id": record.get("case_id", ""),
-				"score": float(score),
-				"text_preview": full_text[:300],
-				"text": full_text,
-			}
-		)
+	print(f"[precedent_retriever] Retrieved {len(results)} precedent chunks.")
+	return results
 
-	print(f"[precedent_retriever] Retrieved {len(results)} precedents.")
+
+# ──────────────────────────────────────────────────────────────────
+# MULTI-QUERY RETRIEVAL + RECIPROCAL RANK FUSION
+# ──────────────────────────────────────────────────────────────────
+
+class QueryVariations(BaseModel):
+	"""Pydantic model for structured query generation output."""
+	queries: List[str]
+
+
+def _generate_query_variations(query: str, n: int = 3) -> List[str]:
+	"""Use the LLM to generate n variations of a legal query."""
+	llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.7)
+	llm_structured = llm.with_structured_output(QueryVariations)
+
+	prompt = (
+		f"You are a legal search expert. Generate {n} different variations of the following "
+		f"legal query. Each variation should approach the same legal issue from a different angle, "
+		f"using different legal terminology or phrasing.\n\n"
+		f"Original query:\n{query}\n\n"
+		f"Return {n} alternative queries."
+	)
+
+	response = llm_structured.invoke(prompt)
+	variations = response.queries[:n]
+
+	print(f"[precedent_retriever] Generated {len(variations)} query variations:")
+	for i, v in enumerate(variations, 1):
+		print(f"  {i}. {v}")
+
+	return variations
+
+
+def _reciprocal_rank_fusion(chunk_lists: List[List], k: int = 60) -> List[tuple]:
+	"""Apply RRF to merge multiple ranked lists into a single ranking."""
+	rrf_scores = defaultdict(float)
+	all_unique_chunks = {}
+
+	for chunks in chunk_lists:
+		for position, chunk in enumerate(chunks, 1):
+			chunk_content = chunk.page_content
+			all_unique_chunks[chunk_content] = chunk
+			rrf_scores[chunk_content] += 1 / (k + position)
+
+	sorted_chunks = sorted(
+		[(all_unique_chunks[content], score) for content, score in rrf_scores.items()],
+		key=lambda x: x[1],
+		reverse=True,
+	)
+
+	return sorted_chunks
+
+
+def retrieve_precedents_multi_query(query: str, top_k: int = 15) -> List[Dict[str, object]]:
+	"""Multi-query retrieval with RRF fusion for better recall on complex legal queries."""
+	if not query or not query.strip():
+		raise ValueError("Query must be a non-empty string.")
+
+	db = _get_db()
+
+	# Step 1: Generate query variations
+	print("[precedent_retriever] Running multi-query retrieval...")
+	variations = _generate_query_variations(query)
+
+	# Step 2: Retrieve for each variation using MMR
+	retriever = db.as_retriever(
+		search_type="mmr",
+		search_kwargs={"k": top_k, "fetch_k": top_k * 3, "lambda_mult": 0.5},
+	)
+
+	all_results = []
+	for i, variation in enumerate(variations, 1):
+		docs = retriever.invoke(variation)
+		all_results.append(docs)
+		print(f"[precedent_retriever] Query {i} returned {len(docs)} chunks.")
+
+	# Step 3: Fuse with RRF
+	fused = _reciprocal_rank_fusion(all_results, k=60)
+	print(f"[precedent_retriever] RRF fused {len(fused)} unique chunks.")
+
+	# Step 4: Format top results
+	results = []
+	for i, (doc, rrf_score) in enumerate(fused[:top_k]):
+		source = doc.metadata.get("source", "unknown")
+		case_id = Path(source).name if source != "unknown" else "unknown"
+		results.append({
+			"rank": i + 1,
+			"case_id": case_id,
+			"rrf_score": round(rrf_score, 4),
+			"text": doc.page_content,
+			"text_preview": doc.page_content[:300],
+		})
+
+	print(f"[precedent_retriever] ✅ Multi-query retrieval returned {len(results)} precedents.")
 	return results
 
 
 if __name__ == "__main__":
-	build_and_save_precedent_index()
+	_build_vector_store()

@@ -13,25 +13,29 @@ def get_fact_extraction_prompt(case_text: str) -> str:
 	)
 
 
-def get_prosecution_prompt(facts: str, statutes: str) -> str:
+def get_prosecution_prompt(facts: str, statutes: str, precedents: str) -> str:
 	return (
 		"You are the prosecution lawyer.\n"
-		"Argue why the accused is guilty based on facts and relevant statutes.\n"
+		"Argue why the accused is guilty based on the facts, relevant statutes, and historical case precedents.\n"
+		"Cite specific statutes and precedent cases to support your argument.\n"
 		"Be concise and structured with these sections:\n"
-		"1) Charges\n2) Key Evidence\n3) Statutory Basis\n4) Conclusion\n\n"
+		"1) Charges\n2) Key Evidence\n3) Statutory Basis\n4) Supporting Precedents\n5) Conclusion\n\n"
 		f"Facts:\n{facts.strip()}\n\n"
-		f"Relevant Statutes:\n{statutes.strip()}"
+		f"Relevant Statutes:\n{statutes.strip()}\n\n"
+		f"Historical Precedents:\n{precedents.strip()}"
 	)
 
 
-def get_defense_prompt(facts: str, prosecution_output: str) -> str:
+def get_defense_prompt(facts: str, prosecution_output: str, precedents: str) -> str:
 	return (
 		"You are the defense lawyer.\n"
 		"Counter the prosecution argument and reduce criminal liability where possible.\n"
+		"Cite historical precedent cases that support the defense's position.\n"
 		"Be concise and structured with these sections:\n"
-		"1) Weaknesses in Prosecution Case\n2) Alternative Interpretation\n3) Mitigating Factors\n4) Relief Sought\n\n"
+		"1) Weaknesses in Prosecution Case\n2) Alternative Interpretation\n3) Supporting Precedents\n4) Mitigating Factors\n5) Relief Sought\n\n"
 		f"Facts:\n{facts.strip()}\n\n"
-		f"Prosecution Argument:\n{prosecution_output.strip()}"
+		f"Prosecution Argument:\n{prosecution_output.strip()}\n\n"
+		f"Historical Precedents:\n{precedents.strip()}"
 	)
 
 

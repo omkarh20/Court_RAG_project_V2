@@ -1,5 +1,6 @@
-faiss-cpu
-numpy
-sentence-transformers
-torch
-transformers
+langchain
+langchain-openai
+langchain-chroma
+langchain-text-splitters
+langchain-community
+python-dotenv
