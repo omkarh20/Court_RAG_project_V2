@@ -1,4 +1,4 @@
-"""Precedent retriever using OpenAI Embeddings + ChromaDB + Multi-Query + RRF."""
+"""Precedent retriever using OpenAI Embeddings + ChromaDB + Hybrid Search + Role-Specific Retrieval."""
 
 from __future__ import annotations
 
@@ -7,9 +7,12 @@ from pathlib import Path
 from typing import Dict, List
 
 from langchain_chroma import Chroma
+from langchain_community.retrievers import BM25Retriever
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import DirectoryLoader, TextLoader
+from langchain.retrievers import EnsembleRetriever
+from langchain_core.documents import Document
 from pydantic import BaseModel
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -17,6 +20,8 @@ CASES_DIR = PROJECT_ROOT / "data" / "cases"
 PERSIST_DIR = PROJECT_ROOT / "vector_db" / "chroma_cases"
 
 _db = None
+_bm25_retriever = None
+_all_docs_cache = None
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -97,13 +102,75 @@ def _build_vector_store() -> Chroma:
 
 
 # ──────────────────────────────────────────────────────────────────
+# BM25 INDEX (KEYWORD MATCHING)
+# ──────────────────────────────────────────────────────────────────
+
+def _build_bm25_retriever(top_k: int = 15) -> BM25Retriever:
+	"""Build a BM25 retriever from all chunks in ChromaDB. Cached after first call."""
+	global _bm25_retriever, _all_docs_cache
+
+	if _bm25_retriever is not None:
+		_bm25_retriever.k = top_k
+		return _bm25_retriever
+
+	db = _get_db()
+	print("[precedent_retriever] Building BM25 index from ChromaDB chunks...")
+
+	# Pull all documents from ChromaDB
+	all_data = db.get(include=["documents", "metadatas"])
+	documents = all_data["documents"]
+	metadatas = all_data["metadatas"]
+
+	# Convert to LangChain Document objects for BM25Retriever
+	_all_docs_cache = [
+		Document(page_content=doc, metadata=meta)
+		for doc, meta in zip(documents, metadatas)
+	]
+
+	print(f"[precedent_retriever] Building BM25 index over {len(_all_docs_cache)} chunks...")
+	_bm25_retriever = BM25Retriever.from_documents(_all_docs_cache)
+	_bm25_retriever.k = top_k
+	print("[precedent_retriever] ✅ BM25 index built.")
+	return _bm25_retriever
+
+
+# ──────────────────────────────────────────────────────────────────
+# HYBRID RETRIEVER (SEMANTIC + BM25)
+# ──────────────────────────────────────────────────────────────────
+
+def _get_hybrid_retriever(top_k: int = 15) -> EnsembleRetriever:
+	"""Create a hybrid retriever combining dense semantic search with sparse BM25."""
+	db = _get_db()
+
+	# Dense retriever (semantic + MMR for diversity)
+	semantic = db.as_retriever(
+		search_type="mmr",
+		search_kwargs={"k": top_k, "fetch_k": top_k * 3, "lambda_mult": 0.5},
+	)
+
+	# Sparse retriever (BM25 keyword matching)
+	bm25 = _build_bm25_retriever(top_k=top_k)
+
+	# Combine with equal weights — EnsembleRetriever uses RRF internally
+	hybrid = EnsembleRetriever(
+		retrievers=[semantic, bm25],
+		weights=[0.7, 0.3],
+	)
+	return hybrid
+
+
+# ──────────────────────────────────────────────────────────────────
 # INITIALIZATION
 # ──────────────────────────────────────────────────────────────────
 
 def initialize_precedent_retriever() -> Dict[str, object]:
-	"""Initialize the precedent retriever. Builds the DB if it doesn't exist."""
+	"""Initialize the precedent retriever. Builds the DB and BM25 index if needed."""
 	db = _get_db()
 	chunk_count = db._collection.count()
+
+	# Pre-build the BM25 index at startup
+	_build_bm25_retriever()
+
 	created = not PERSIST_DIR.exists() or chunk_count == 0
 	return {
 		"created": created,
@@ -112,41 +179,25 @@ def initialize_precedent_retriever() -> Dict[str, object]:
 
 
 # ──────────────────────────────────────────────────────────────────
-# BASIC RETRIEVAL (MMR)
+# BASIC RETRIEVAL (HYBRID)
 # ──────────────────────────────────────────────────────────────────
 
 def retrieve_precedents(query: str, top_k: int = 15) -> List[Dict[str, object]]:
-	"""Retrieve top-k precedent chunks using MMR for diversity."""
+	"""Retrieve top-k precedent chunks using hybrid search (Semantic + BM25)."""
 	if not query or not query.strip():
 		raise ValueError("Query must be a non-empty string.")
 
-	db = _get_db()
+	print(f"[precedent_retriever] Retrieving top {top_k} precedents (Hybrid)...")
+	hybrid = _get_hybrid_retriever(top_k=top_k)
+	docs = hybrid.invoke(query)
 
-	print(f"[precedent_retriever] Retrieving top {top_k} precedents (MMR)...")
-	retriever = db.as_retriever(
-		search_type="mmr",
-		search_kwargs={"k": top_k, "fetch_k": top_k * 3, "lambda_mult": 0.5},
-	)
-
-	docs = retriever.invoke(query)
-
-	results = []
-	for i, doc in enumerate(docs):
-		source = doc.metadata.get("source", "unknown")
-		case_id = Path(source).name if source != "unknown" else "unknown"
-		results.append({
-			"rank": i + 1,
-			"case_id": case_id,
-			"text": doc.page_content,
-			"text_preview": doc.page_content[:300],
-		})
-
+	results = _format_results(docs[:top_k])
 	print(f"[precedent_retriever] Retrieved {len(results)} precedent chunks.")
 	return results
 
 
 # ──────────────────────────────────────────────────────────────────
-# MULTI-QUERY RETRIEVAL + RECIPROCAL RANK FUSION
+# ROLE-SPECIFIC RETRIEVAL (INDEPENDENT AGENTIC SEARCH)
 # ──────────────────────────────────────────────────────────────────
 
 class QueryVariations(BaseModel):
@@ -154,23 +205,37 @@ class QueryVariations(BaseModel):
 	queries: List[str]
 
 
-def _generate_query_variations(query: str, n: int = 3) -> List[str]:
-	"""Use the LLM to generate n variations of a legal query."""
+_ROLE_QUERY_TEMPLATES = {
+	"prosecution": (
+		"You are a legal search expert working for the PROSECUTION.\n"
+		"Generate {n} search queries to find precedent cases where the accused was CONVICTED "
+		"for similar crimes. Focus on cases establishing intent, weapon use, and fatal outcomes.\n\n"
+		"Facts of the current case:\n{facts}\n\n"
+		"Return {n} search queries."
+	),
+	"defense": (
+		"You are a legal search expert working for the DEFENSE.\n"
+		"Generate {n} search queries to find precedent cases where the accused was ACQUITTED "
+		"or received a REDUCED SENTENCE. Focus on provocation, lack of premeditation, "
+		"self-defense, and mitigating circumstances.\n\n"
+		"Facts of the current case:\n{facts}\n\n"
+		"Return {n} search queries."
+	),
+}
+
+
+def _generate_role_queries(facts: str, role: str, n: int = 3) -> List[str]:
+	"""Generate role-specific query variations using the LLM."""
 	llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.7)
 	llm_structured = llm.with_structured_output(QueryVariations)
 
-	prompt = (
-		f"You are a legal search expert. Generate {n} different variations of the following "
-		f"legal query. Each variation should approach the same legal issue from a different angle, "
-		f"using different legal terminology or phrasing.\n\n"
-		f"Original query:\n{query}\n\n"
-		f"Return {n} alternative queries."
-	)
+	template = _ROLE_QUERY_TEMPLATES[role]
+	prompt = template.format(n=n, facts=facts)
 
 	response = llm_structured.invoke(prompt)
 	variations = response.queries[:n]
 
-	print(f"[precedent_retriever] Generated {len(variations)} query variations:")
+	print(f"[precedent_retriever] Generated {len(variations)} {role} queries:")
 	for i, v in enumerate(variations, 1):
 		print(f"  {i}. {v}")
 
@@ -197,32 +262,30 @@ def _reciprocal_rank_fusion(chunk_lists: List[List], k: int = 60) -> List[tuple]
 	return sorted_chunks
 
 
-def retrieve_precedents_multi_query(query: str, top_k: int = 15) -> List[Dict[str, object]]:
-	"""Multi-query retrieval with RRF fusion for better recall on complex legal queries."""
-	if not query or not query.strip():
-		raise ValueError("Query must be a non-empty string.")
+def retrieve_for_role(facts: str, role: str, top_k: int = 10) -> List[Dict[str, object]]:
+	"""Role-specific retrieval: prosecution and defense each get their own tailored precedents."""
+	if role not in ("prosecution", "defense"):
+		raise ValueError("role must be 'prosecution' or 'defense'")
+	if not facts or not facts.strip():
+		raise ValueError("Facts must be a non-empty string.")
 
-	db = _get_db()
+	print(f"[precedent_retriever] Running {role} role-specific retrieval...")
 
-	# Step 1: Generate query variations
-	print("[precedent_retriever] Running multi-query retrieval...")
-	variations = _generate_query_variations(query)
+	# Step 1: Generate role-biased query variations
+	variations = _generate_role_queries(facts, role)
 
-	# Step 2: Retrieve for each variation using MMR
-	retriever = db.as_retriever(
-		search_type="mmr",
-		search_kwargs={"k": top_k, "fetch_k": top_k * 3, "lambda_mult": 0.5},
-	)
+	# Step 2: Retrieve for each variation using Hybrid search
+	hybrid = _get_hybrid_retriever(top_k=top_k)
 
 	all_results = []
 	for i, variation in enumerate(variations, 1):
-		docs = retriever.invoke(variation)
+		docs = hybrid.invoke(variation)
 		all_results.append(docs)
-		print(f"[precedent_retriever] Query {i} returned {len(docs)} chunks.")
+		print(f"[precedent_retriever] {role.capitalize()} query {i} returned {len(docs)} chunks.")
 
 	# Step 3: Fuse with RRF
 	fused = _reciprocal_rank_fusion(all_results, k=60)
-	print(f"[precedent_retriever] RRF fused {len(fused)} unique chunks.")
+	print(f"[precedent_retriever] RRF fused {len(fused)} unique chunks for {role}.")
 
 	# Step 4: Format top results
 	results = []
@@ -237,7 +300,26 @@ def retrieve_precedents_multi_query(query: str, top_k: int = 15) -> List[Dict[st
 			"text_preview": doc.page_content[:300],
 		})
 
-	print(f"[precedent_retriever] ✅ Multi-query retrieval returned {len(results)} precedents.")
+	print(f"[precedent_retriever] ✅ {role.capitalize()} retrieval returned {len(results)} precedents.")
+	return results
+
+
+# ──────────────────────────────────────────────────────────────────
+# HELPERS
+# ──────────────────────────────────────────────────────────────────
+
+def _format_results(docs: list) -> List[Dict[str, object]]:
+	"""Format LangChain Document objects into result dicts."""
+	results = []
+	for i, doc in enumerate(docs):
+		source = doc.metadata.get("source", "unknown")
+		case_id = Path(source).name if source != "unknown" else "unknown"
+		results.append({
+			"rank": i + 1,
+			"case_id": case_id,
+			"text": doc.page_content,
+			"text_preview": doc.page_content[:300],
+		})
 	return results
 
 

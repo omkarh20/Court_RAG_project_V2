@@ -4,3 +4,6 @@ langchain-chroma
 langchain-text-splitters
 langchain-community
 python-dotenv
+rank_bm25
+ragas
+datasets

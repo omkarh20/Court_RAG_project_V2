@@ -1,4 +1,4 @@
-"""Statute retriever using OpenAI Embeddings + ChromaDB."""
+"""Statute retriever using OpenAI Embeddings + ChromaDB + Hybrid Search."""
 
 from __future__ import annotations
 
@@ -6,15 +6,19 @@ from pathlib import Path
 from typing import Dict, List
 
 from langchain_chroma import Chroma
+from langchain_community.retrievers import BM25Retriever
 from langchain_openai import OpenAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import DirectoryLoader, TextLoader
+from langchain.retrievers import EnsembleRetriever
+from langchain_core.documents import Document
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 STATUTES_DIR = PROJECT_ROOT / "data" / "statutes"
 PERSIST_DIR = PROJECT_ROOT / "vector_db" / "chroma_statutes"
 
 _db = None
+_bm25_retriever = None
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -94,13 +98,67 @@ def _build_vector_store() -> Chroma:
 
 
 # ──────────────────────────────────────────────────────────────────
+# BM25 INDEX
+# ──────────────────────────────────────────────────────────────────
+
+def _build_bm25_retriever(top_k: int = 5) -> BM25Retriever:
+	"""Build a BM25 retriever from all statute chunks. Cached after first call."""
+	global _bm25_retriever
+
+	if _bm25_retriever is not None:
+		_bm25_retriever.k = top_k
+		return _bm25_retriever
+
+	db = _get_db()
+	print("[statute_retriever] Building BM25 index from ChromaDB chunks...")
+
+	all_data = db.get(include=["documents", "metadatas"])
+	docs = [
+		Document(page_content=doc, metadata=meta)
+		for doc, meta in zip(all_data["documents"], all_data["metadatas"])
+	]
+
+	print(f"[statute_retriever] Building BM25 index over {len(docs)} chunks...")
+	_bm25_retriever = BM25Retriever.from_documents(docs)
+	_bm25_retriever.k = top_k
+	print("[statute_retriever] ✅ BM25 index built.")
+	return _bm25_retriever
+
+
+# ──────────────────────────────────────────────────────────────────
+# HYBRID RETRIEVER
+# ──────────────────────────────────────────────────────────────────
+
+def _get_hybrid_retriever(top_k: int = 5) -> EnsembleRetriever:
+	"""Create a hybrid retriever combining semantic search with BM25."""
+	db = _get_db()
+
+	semantic = db.as_retriever(
+		search_type="mmr",
+		search_kwargs={"k": top_k, "fetch_k": top_k * 3, "lambda_mult": 0.5},
+	)
+
+	bm25 = _build_bm25_retriever(top_k=top_k)
+
+	hybrid = EnsembleRetriever(
+		retrievers=[semantic, bm25],
+		weights=[0.5, 0.5],
+	)
+	return hybrid
+
+
+# ──────────────────────────────────────────────────────────────────
 # INITIALIZATION
 # ──────────────────────────────────────────────────────────────────
 
 def initialize_statute_retriever() -> Dict[str, object]:
-	"""Initialize the statute retriever. Builds the DB if it doesn't exist."""
+	"""Initialize the statute retriever. Builds the DB and BM25 index if needed."""
 	db = _get_db()
 	chunk_count = db._collection.count()
+
+	# Pre-build the BM25 index at startup
+	_build_bm25_retriever()
+
 	created = not PERSIST_DIR.exists() or chunk_count == 0
 	return {
 		"created": created,
@@ -109,26 +167,20 @@ def initialize_statute_retriever() -> Dict[str, object]:
 
 
 # ──────────────────────────────────────────────────────────────────
-# RETRIEVAL (MMR)
+# RETRIEVAL (HYBRID)
 # ──────────────────────────────────────────────────────────────────
 
 def retrieve_statutes(query: str, top_k: int = 5) -> List[Dict[str, object]]:
-	"""Retrieve top-k statute chunks using MMR for diversity."""
+	"""Retrieve top-k statute chunks using hybrid search (Semantic + BM25)."""
 	if not query or not query.strip():
 		raise ValueError("Query must be a non-empty string.")
 
-	db = _get_db()
-
-	print(f"[statute_retriever] Retrieving top {top_k} statutes (MMR)...")
-	retriever = db.as_retriever(
-		search_type="mmr",
-		search_kwargs={"k": top_k, "fetch_k": top_k * 3, "lambda_mult": 0.5},
-	)
-
-	docs = retriever.invoke(query)
+	print(f"[statute_retriever] Retrieving top {top_k} statutes (Hybrid)...")
+	hybrid = _get_hybrid_retriever(top_k=top_k)
+	docs = hybrid.invoke(query)
 
 	results = []
-	for i, doc in enumerate(docs):
+	for i, doc in enumerate(docs[:top_k]):
 		source = doc.metadata.get("source", "unknown")
 		filename = Path(source).name if source != "unknown" else "unknown"
 		results.append({
